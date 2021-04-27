@@ -351,6 +351,37 @@ class EltwiseProdScoring(nn.Module):
         logits = self.linear_out(eltprod).squeeze(2)  # batch x a_num
         return logits
 
+class EltwiseProdScoringGaze(nn.Module):
+    '''
+    Linearly mapping h and v to the same dimension, and do a elementwise
+    multiplication and a linear scoring
+    '''
+
+    def __init__(self, h_dim, a_dim, dot_dim=256):
+        '''Initialize layer.'''
+        super(EltwiseProdScoringGaze, self).__init__()
+        self.linear_in_h = nn.Linear(h_dim, dot_dim, bias=True)
+        self.linear_in_a = nn.Linear(a_dim, dot_dim, bias=True)
+        self.linear_in_h2 = nn.Linear(h_dim, dot_dim, bias=True)
+        self.linear_in_a2 = nn.Linear(a_dim, dot_dim, bias=True)
+        self.linear_out = nn.Linear(dot_dim*2, 1, bias=True)
+
+    def forward(self, h1, all_u_t, h2, action, mask=None):
+        '''Propagate h through the network.
+
+        h: batch x h_dim
+        all_u_t: batch x a_num x a_dim
+        '''
+        target1 = self.linear_in_h(h1).unsqueeze(1)  # batch x 1 x dot_dim
+        context1 = self.linear_in_a(all_u_t)  # batch x a_num x dot_dim
+        target2 = self.linear_in_h2(h2).unsqueeze(1)  # batch x 1 x dot_dim
+        context2 = self.linear_in_a2(action)  # batch x a_num x dot_dim
+        eltprod1 = torch.mul(target1, context1)  # batch x a_num x dot_dim
+        eltprod2 = torch.mul(target2, context2)  # batch x a_num x dot_dim
+        eltprod = torch.cat([eltprod1,eltprod2],axis=-1)
+        #import ipdb; ipdb.set_trace()
+        logits = self.linear_out(eltprod).squeeze(2)  # batch x a_num
+        return logits
 
 class AttnDecoderLSTM(nn.Module):
     '''
@@ -386,6 +417,7 @@ class AttnDecoderLSTM(nn.Module):
         ctx: batch x seq_len x dim
         ctx_mask: batch x seq_len - indices to be masked
         '''
+        #import ipdb; ipdb.set_trace()
         feature, alpha_v = self.visual_attention_layer(h_0, visual_context)
         # (batch, embedding_size+feature_size)
         concat_input = torch.cat((u_t_prev, feature), 1)
@@ -428,6 +460,8 @@ class SpeakerEncoderLSTM(nn.Module):
 
     def _forward_one_step(self, h_0, c_0, action_embedding,
                           world_state_embedding):
+        #print(h_0.shape)
+        #print(world_state_embedding.shape)
         feature, _ = self.visual_attention_layer(h_0, world_state_embedding)
         concat_input = torch.cat((action_embedding, feature), 1)
         drop = self.drop(concat_input)
@@ -440,6 +474,7 @@ class SpeakerEncoderLSTM(nn.Module):
         assert isinstance(batched_action_embeddings, list)
         assert isinstance(world_state_embeddings, list)
         assert len(batched_action_embeddings) == len(world_state_embeddings)
+        #import ipdb; ipdb.set_trace()
         batch_size = world_state_embeddings[0].shape[0]
 
         h, c = self.init_state(batch_size)
@@ -454,8 +489,8 @@ class SpeakerEncoderLSTM(nn.Module):
 
         ctx = torch.stack(h_list, dim=1)  # (batch, seq_len, hidden_size)
         ctx = self.drop(ctx)
-        return ctx, decoder_init, c  # (batch, hidden_size)
 
+        return ctx, decoder_init, c  # ctx, h_t, c_t : (batch, hidden_size)
 
 class SpeakerDecoderLSTM(nn.Module):
     def __init__(self, vocab_size, vocab_embedding_size, hidden_size,
@@ -502,8 +537,7 @@ class SpeakerDecoderLSTM(nn.Module):
             word_embeds_drop = word_embeds
 
         if self.use_input_att_feed:
-            h_tilde, alpha = self.attention_layer(
-                self.drop(h_0), ctx, ctx_mask)
+            h_tilde, alpha = self.attention_layer(self.drop(h_0), ctx, ctx_mask)
             concat_input = torch.cat((word_embeds_drop, self.drop(h_tilde)), 1)
             h_1, c_1 = self.lstm(concat_input, (h_0, c_0))
             x = torch.cat((h_1, h_tilde), 1)
@@ -517,3 +551,64 @@ class SpeakerDecoderLSTM(nn.Module):
             h_tilde, alpha = self.attention_layer(h_1_drop, ctx, ctx_mask)
             logit = self.decoder2action(h_tilde)
         return h_1, c_1, alpha, logit
+
+#class Environmental(nn.Module):
+#    def __init__(self, vocab_size, vocab_embedding_size, hidden_size,
+#                 dropout_ratio, glove=None, use_input_att_feed=False):
+#        super(Environmental, self).__init__()
+#        self.vocab_size = 1
+#        self.vocab_embedding_size = vocab_embedding_size
+#        self.hidden_size = hidden_size
+#        self.embedding = nn.Embedding(vocab_size, vocab_embedding_size)
+#        self.use_glove = glove is not None
+#        if self.use_glove:
+#            print('Using GloVe embedding')
+#            self.embedding.weight.data[...] = torch.from_numpy(glove)
+#            self.embedding.weight.requires_grad = False
+#        self.drop = nn.Dropout(p=dropout_ratio)
+#        self.use_input_att_feed = use_input_att_feed
+#        if self.use_input_att_feed:
+#            print('using input attention feed in SpeakerDecoderLSTM')
+#            self.lstm = nn.LSTMCell(
+#                vocab_embedding_size + hidden_size, hidden_size)
+#            self.attention_layer = ContextOnlySoftDotAttention(hidden_size)
+#            self.output_l1 = nn.Linear(hidden_size*2, hidden_size)
+#            self.tanh = nn.Tanh()
+#        else:
+#            self.lstm = nn.LSTMCell(vocab_embedding_size, hidden_size)
+#            self.attention_layer = SoftDotAttention(hidden_size)
+#        self.decoder2action = nn.Linear(hidden_size, vocab_size)
+#
+#    def forward(self, previous_word, h_0, c_0, ctx, ctx_mask=None):
+#        ''' Takes a single step in the decoder LSTM (allowing sampling).
+#
+#        action: batch x 1
+#        feature: batch x feature_size
+#        h_0: batch x hidden_size
+#        c_0: batch x hidden_size
+#        ctx: batch x seq_len x dim
+#        ctx_mask: batch x seq_len - indices to be masked
+#        '''
+#        word_embeds = self.embedding(previous_word)
+#        word_embeds = word_embeds.squeeze()  # (batch, embedding_size)
+#        if not self.use_glove:
+#            word_embeds_drop = self.drop(word_embeds)
+#        else:
+#            word_embeds_drop = word_embeds
+#
+#        if self.use_input_att_feed:
+#            h_tilde, alpha = self.attention_layer(
+#                self.drop(h_0), ctx, ctx_mask)
+#            concat_input = torch.cat((word_embeds_drop, self.drop(h_tilde)), 1)
+#            h_1, c_1 = self.lstm(concat_input, (h_0, c_0))
+#            x = torch.cat((h_1, h_tilde), 1)
+#            x = self.drop(x)
+#            x = self.output_l1(x)
+#            x = self.tanh(x)
+#            logit = self.decoder2action(x)
+#        else:
+#            h_1, c_1 = self.lstm(word_embeds_drop, (h_0, c_0))
+#            h_1_drop = self.drop(h_1)
+#            h_tilde, alpha = self.attention_layer(h_1_drop, ctx, ctx_mask)
+#            logit = self.decoder2action(h_tilde)
+#        return h_1, c_1, alpha, logit

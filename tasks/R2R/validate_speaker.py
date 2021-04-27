@@ -25,7 +25,7 @@ def validate_entry_point(args):
         #         utils.pretty_json_dump(gold_results, f)
 
         # predicted
-        pred_results = agent.test(use_dropout=False, feedback='argmax')
+        pred_results = agent.test(args, use_dropout=False, feedback='argmax')
         pred_score_summary, _ = evaluator.score_results(
             pred_results, verbose=False)
 

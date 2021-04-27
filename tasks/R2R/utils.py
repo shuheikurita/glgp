@@ -14,6 +14,10 @@ import subprocess
 import itertools
 import base64
 
+import torch
+import logging
+
+logger = logging.getLogger(__name__)
 
 # padding, unknown word, end of sentence
 base_vocab = ['<PAD>', '<UNK>', '<EOS>', '<BOS>']
@@ -51,11 +55,13 @@ def load_nav_graphs(scans):
     return graphs
 
 
-def load_datasets(splits):
+def load_datasets(splits, base_path="tasks/R2R/data/R2R"):
     data = []
     for split in splits:
-        with open('tasks/R2R/data/R2R_%s.json' % split) as f:
-            data += json.load(f)
+        with open(base_path+'_%s.json' % split) as f:
+            datum = json.load(f)
+        print("load_datasets: ",split,len(datum))
+        data+=datum
     return data
 
 def decode_base64(string):
@@ -89,11 +95,12 @@ class Tokenizer(object):
                 toks.append(word)
         return toks
 
-    def encode_sentence(self, sentence):
+    def encode_sentence(self, sentence, include_tokens=False):
         if len(self.word_to_index) == 0:
             sys.exit('Tokenizer has no vocab')
         encoding = []
-        for word in Tokenizer.split_sentence(sentence):
+        words = Tokenizer.split_sentence(sentence)
+        for word in words:
             if word in self.word_to_index:
                 encoding.append(self.word_to_index[word])
             else:
@@ -104,7 +111,10 @@ class Tokenizer(object):
             #encoding += [vocab_pad_idx] * (self.encoding_length - len(encoding))
         #encoding = encoding[:self.encoding_length] # leave room for unks
         arr = np.array(encoding)
-        return arr, len(encoding)
+        if include_tokens:
+            return arr, len(encoding), words
+        else:
+            return arr, len(encoding)
 
     def decode_sentence(self, encoding, break_on_eos=False, join=True):
         sentence = []
@@ -121,6 +131,7 @@ class Tokenizer(object):
 def build_vocab(splits=['train'], min_count=5, start_vocab=base_vocab):
     ''' Build a vocab, starting with base vocab containing a few useful tokens. '''
     count = Counter()
+    raise NotImplemented("No R2R compatible! For R2R, just remove me.")
     data = load_datasets(splits)
     for item in data:
         for instr in item['instructions']:
@@ -185,6 +196,31 @@ def structured_map(function, *args, **kwargs):
         acc.append(mapped)
     return acc
 
+def rec_numpy2list(obj):
+    if isinstance(obj,np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj,np.generic):
+        return obj.item()
+    elif isinstance(obj,list):
+        return [rec_numpy2list(o) for o in obj]
+    elif isinstance(obj,dict):
+        return {k:rec_numpy2list(v) for k,v in obj.items()}
+    elif isinstance(obj,set):
+        return {rec_numpy2list(v) for v in obj}
+    else:
+        return obj
+def rec_torch2numpy(obj):
+    if isinstance(obj,torch.Tensor):
+        return obj.cpu().data.numpy()
+    elif isinstance(obj,list):
+        return [rec_torch2numpy(o) for o in obj]
+    elif isinstance(obj,dict):
+        return {k:rec_torch2numpy(v) for k,v in obj.items()}
+    elif isinstance(obj,set):
+        return {rec_torch2numpy(v) for v in obj}
+    else:
+        return obj
+
 
 def flatten(lol):
     return [l for lst in lol for l in lst]
@@ -234,8 +270,18 @@ def run(arg_parser, entry_function):
     arg_parser.add_argument("--pdb", action='store_true')
     arg_parser.add_argument("--ipdb", action='store_true')
     arg_parser.add_argument("--no_cuda", action='store_true')
+    arg_parser.add_argument("--git", action='store_true')
+    arg_parser.add_argument("--debug", action='store_true')
+    arg_parser.add_argument("--debug_minimal", type=int, default=-1)
 
     args = arg_parser.parse_args()
+
+    # Setup logging
+    logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+                        datefmt = '%m/%d/%Y %H:%M:%S',
+                        level = logging.DEBUG if args.debug else logging.INFO)
+                        #level = logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
+    #logger = logging.getLogger(__name__)
 
     import torch.cuda
     # todo: yuck
@@ -250,7 +296,8 @@ def run(arg_parser, entry_function):
         json.dump(vars(args), out_file)
         out_file.write('\n\n')
 
-    log(sys.stdout)
+    if args.git:
+        log(sys.stdout)
     # if 'save_dir' in vars(args) and args.save_dir:
     #     with open(os.path.join(args.save_dir, 'invoke.log'), 'w') as f:
     #         log(f)
@@ -263,3 +310,43 @@ def run(arg_parser, entry_function):
         pdb.runcall(entry_function, args)
     else:
         entry_function(args)
+
+def assert2(A,B):
+    assert A==B,(A,B)
+
+
+def get_model_prefix(args, image_feature_list):
+    image_feature_name = "+".join(
+        [featurizer.get_name() for featurizer in image_feature_list])
+    model_prefix = '{}_{}_{}_{}'.format(
+        args.model_name, args.feedback_method, image_feature_name, args.loss_type)
+    if args.use_train_subset:
+        model_prefix = 'trainsub_' + model_prefix
+    if args.bidirectional:
+        model_prefix = model_prefix + "_bidirectional"
+    if args.use_pretraining:
+        #model_prefix = model_prefix.replace(
+        #    'follower', 'follower_with_pretraining', 1)
+        model_prefix += "_with_pretraining"
+    if args.follower_prefix!="":
+        model_prefix += "_fp="+args.follower_model_name
+    if args.speaker_prefix!="":
+        model_prefix += "_sp="+args.speaker_model_name
+    #if args.follower_prefix!="":
+    #    model_prefix += "_fp="+args.follower_prefix.split("/")[-1]
+    #if args.speaker_prefix!="":
+    #    model_prefix += "_sp="+args.speaker_prefix.split("/")[-1]
+    return model_prefix
+
+
+# Partially update the models' state_dict
+def update_state_dict(model, pretrained_dict):
+    # 0. get state_dict
+    model_dict = model.state_dict()
+    # 1. filter out unnecessary keys
+    pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+    # 2. overwrite entries in the existing state dict
+    model_dict.update(pretrained_dict)
+    # 3. load the new state dict
+    model.load_state_dict(model_dict)
+    return model

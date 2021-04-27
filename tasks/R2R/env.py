@@ -18,6 +18,7 @@ import os
 import os.path
 import sys
 import itertools
+import logging
 
 from collections import namedtuple, defaultdict
 
@@ -27,6 +28,8 @@ import torch
 from torch.autograd import Variable
 
 csv.field_size_limit(sys.maxsize)
+
+logger = logging.getLogger(__name__)
 
 # Not needed for panorama action space
 # FOLLOWER_MODEL_ACTIONS = ['left', 'right', 'up', 'down', 'forward', '<end>', '<start>', '<ignore>']
@@ -57,23 +60,30 @@ csv.field_size_limit(sys.maxsize)
 angle_inc = np.pi / 6.
 
 
-def _build_action_embedding(adj_loc_list, features):
+def _build_action_embedding(adj_loc_list, features, init_emb=None):
     feature_dim = features.shape[-1]
     embedding = np.zeros((len(adj_loc_list), feature_dim + 128), np.float32)
     for a, adj_dict in enumerate(adj_loc_list):
         if a == 0:
             # the embedding for the first action ('stop') is left as zero
-            continue
-        embedding[a, :feature_dim] = features[adj_dict['absViewIndex']]
-        loc_embedding = embedding[a, feature_dim:]
-        rel_heading = adj_dict['rel_heading']
-        rel_elevation = adj_dict['rel_elevation']
-        loc_embedding[0:32] = np.sin(rel_heading)
-        loc_embedding[32:64] = np.cos(rel_heading)
-        loc_embedding[64:96] = np.sin(rel_elevation)
-        loc_embedding[96:] = np.cos(rel_elevation)
+            pass
+        elif a == -1:
+            embedding = init_emb
+        else:
+            embedding[a, :feature_dim] = features[adj_dict['absViewIndex']]
+            loc_embedding = embedding[a, feature_dim:]
+            rel_heading = adj_dict['rel_heading']
+            rel_elevation = adj_dict['rel_elevation']
+            loc_embedding[0:32] = np.sin(rel_heading)
+            loc_embedding[32:64] = np.cos(rel_heading)
+            loc_embedding[64:96] = np.sin(rel_elevation)
+            loc_embedding[96:] = np.cos(rel_elevation)
     return embedding
 
+def _initial_action_embedding(feature_dim):
+    logger.info("feature_dim %d"%feature_dim)
+    embedding = np.random.rand(1, feature_dim + 128)*0.01 #, np.float32)*0.01
+    return embedding
 
 def build_viewpoint_loc_embedding(viewIndex):
     """
@@ -309,7 +319,7 @@ class ImageFeatures(object):
                     split_convolutional_features=True,
                     downscale_convolutional_features=args.downscale_convolutional_features
                 ))
-                raise NotImplementedError('convolutional_attention has not been implemented for panorama environment')
+                #raise NotImplementedError('convolutional_attention has not been implemented for panorama environment')
             else:
                 assert image_feature_type == "mean_pooled"
                 feats.append(MeanPooledImageFeatures(args.image_feature_datasets))
@@ -338,7 +348,7 @@ class NoImageFeatures(ImageFeatures):
     feature_dim = ImageFeatures.MEAN_POOLED_DIM
 
     def __init__(self):
-        print('Image features not provided')
+        logger.info('Image features not provided')
         self.features = np.zeros((ImageFeatures.NUM_VIEWS, self.feature_dim), dtype=np.float32)
 
     def get_features(self, state):
@@ -355,7 +365,7 @@ class MeanPooledImageFeatures(ImageFeatures):
         self.mean_pooled_feature_stores = [paths.mean_pooled_feature_store_paths[dataset]
                                            for dataset in image_feature_datasets]
         self.feature_dim = MeanPooledImageFeatures.MEAN_POOLED_DIM * len(image_feature_datasets)
-        print('Loading image features from %s' % ', '.join(self.mean_pooled_feature_stores))
+        logger.info('Loading image features from %s' % ', '.join(self.mean_pooled_feature_stores))
         tsv_fieldnames = ['scanId', 'viewpointId', 'image_w','image_h', 'vfov', 'features']
         self.features = defaultdict(list)
         for mpfs in self.mean_pooled_feature_stores:
@@ -368,11 +378,14 @@ class MeanPooledImageFeatures(ImageFeatures):
                     long_id = self._make_id(item['scanId'], item['viewpointId'])
                     features = np.frombuffer(decode_base64(item['features']), dtype=np.float32).reshape((ImageFeatures.NUM_VIEWS, ImageFeatures.MEAN_POOLED_DIM))
                     self.features[long_id].append(features)
+            #import ipdb; ipdb.set_trace()
         assert all(len(feats) == len(self.mean_pooled_feature_stores) for feats in self.features.values())
         self.features = {
             long_id: np.concatenate(feats, axis=1)
             for long_id, feats in self.features.items()
         }
+        logger.info('Number of Loaded image features %d'%len(self.features))
+        assert "VzqfbhrpDEA_0331b320ae1f41d0b42fdf0100e56bd2" in self.features
 
     def _make_id(self, scanId, viewpointId):
         return scanId + '_' + viewpointId
@@ -414,6 +427,7 @@ class ConvolutionalImageFeatures(ImageFeatures):
                 mmapped = np.load(path, mmap_mode='r')
                 this_feats = mmapped[viewIndex,:,:,:]
             feats.append(this_feats)
+        import ipdb; ipdb.set_trace()
         if len(feats) > 1:
             return np.concatenate(feats, axis=1)
         return feats[0]
@@ -551,7 +565,7 @@ class BottomUpImageFeatures(ImageFeatures):
         for viewpoint in data:
             top_indices = k_best_indices(viewpoint['cls_prob'], self.number_of_detections, sorted=True)[::-1]
 
-            no_object = np.full(self.number_of_detections, True, dtype=np.uint8) # will become torch Byte tensor
+            no_object = np.full(self.number_of_detections, True, dtype=np.bool) # will become torch Byte tensor
             no_object[0:len(top_indices)] = False
 
             cls_prob = np.zeros(self.number_of_detections, dtype=np.float32)
@@ -586,15 +600,22 @@ class EnvBatch():
     ''' A simple wrapper for a batch of MatterSim environments,
         using discretized viewpoints and pretrained features '''
 
-    def __init__(self, batch_size, beam_size):
+    def __init__(self, batch_size, beam_size, jagged=False):
+        assert jagged==False or len(jagged)==batch_size
         self.sims = []
         self.batch_size = batch_size
-        self.beam_size = beam_size
+        self.beam_size = beam_size if not jagged else jagged
+        self.jagged = jagged
         for i in range(batch_size):
             beam = []
-            for j in range(beam_size):
-                sim = make_sim(ImageFeatures.IMAGE_W, ImageFeatures.IMAGE_H, ImageFeatures.VFOV)
-                beam.append(sim)
+            if not self.jagged:
+                for j in range(self.beam_size):
+                    sim = make_sim(ImageFeatures.IMAGE_W, ImageFeatures.IMAGE_H, ImageFeatures.VFOV)
+                    beam.append(sim)
+            else:
+                for j in range(self.jagged[i]):
+                    sim = make_sim(ImageFeatures.IMAGE_W, ImageFeatures.IMAGE_H, ImageFeatures.VFOV)
+                    beam.append(sim)
             self.sims.append(beam)
 
     def sims_view(self, beamed):
@@ -640,6 +661,19 @@ class EnvBatch():
             return get_world_state(sim)
         return structured_map(f, self.sims_view(beamed), world_states, actions, last_obs, nested=beamed)
 
+    def makeActions_and_getStates(self, world_states, actions, last_obs, beamed=False):
+        def f(sim, world_state, action, last_ob):
+            load_world_state(sim, world_state)
+            # load the location attribute corresponding to the action
+            loc_attr = last_ob['adj_loc_list'][action]
+            _navigate_to_location(
+                sim, loc_attr['nextViewpointId'], loc_attr['absViewIndex'])
+            # sim.makeAction(index, heading, elevation)
+            next_world_state = get_world_state(sim)
+            next_panorama_state = _get_panorama_states(sim)
+            return next_world_state, next_panorama_state
+        return structured_map(f, self.sims_view(beamed), world_states, actions, last_obs, nested=beamed)
+
     # def makeSimpleActions(self, simple_indices, beamed=False):
     #     ''' Take an action using a simple interface: 0-forward, 1-turn left, 2-turn right, 3-look up, 4-look down.
     #         All viewpoint changes are 30 degrees. Forward, look up and look down may not succeed - check state.
@@ -664,14 +698,20 @@ class EnvBatch():
 class R2RBatch():
     ''' Implements the Room to Room navigation task, using discretized viewpoints and pretrained features '''
 
-    def __init__(self, image_features_list, batch_size=100, seed=10, splits=['train'], tokenizer=None, beam_size=1, instruction_limit=None):
+    def __init__(self, args, image_features_list, batch_size=-1, seed=10, splits=['train'],
+                 tokenizer=None, beam_size=1, instruction_limit=None,
+                 bert_tokenizer=None, debug_minimal=False, r2r_dataset_path=None):
+        assert batch_size>0
         self.image_features_list = image_features_list
         self.data = []
         self.scans = []
         self.gt = {}
-        for item in load_datasets(splits):
+        data = load_datasets(splits, base_path=r2r_dataset_path)
+        stat_length = defaultdict(int)
+        for i,item in enumerate(data):
             # Split multiple instructions into separate entries
-            assert item['path_id'] not in self.gt
+            if not args.r4r_small:
+                assert item['path_id'] not in self.gt
             self.gt[item['path_id']] = item
             instructions = item['instructions']
             if instruction_limit:
@@ -683,21 +723,55 @@ class R2RBatch():
                 new_item['instructions'] = instr
                 if tokenizer:
                     self.tokenizer = tokenizer
-                    new_item['instr_encoding'], new_item['instr_length'] = tokenizer.encode_sentence(instr)
+                    #new_item['instr_encoding'], new_item['instr_length'] = tokenizer.encode_sentence(instr)
+                    new_item['instr_encoding'], new_item['instr_length'], new_item['words'] = self.tokenizer.encode_sentence(instr,include_tokens=True)
+                    stat_length[new_item['instr_length']]+=1
                 else:
                     self.tokenizer = None
+                if bert_tokenizer:
+                    self.bert_tokenizer = bert_tokenizer
+                    new_item['bert_words'] = ["[CLS]"]+new_item['words']+["[SEP]"]
+                    new_item['bert_subwords'] = bert_tokenizer.tokenize(" ".join(new_item['bert_words']))
+                    new_item['instr_encoding_bert'] = bert_tokenizer.convert_tokens_to_ids(new_item['bert_subwords'])
+                    #tokens_tensor = torch.tensor([new_item['instr_encoding_bert']])
+                    #segments_tensors = torch.tensor([1]*len(new_item['instr_encoding_bert']))
+                    #with torch.no_grad():
+                    #    encoded_layers, _ = bert_model(try_cuda(tokens_tensor), try_cuda(segments_tensors))
+                    #new_item['bert_embedding'] = encoded_layers
+                    #print(new_item["words"])
                 self.data.append(new_item)
+            if debug_minimal>0 and i+1==debug_minimal:
+                break
         self.scans = set(self.scans)
         self.splits = splits
         self.seed = seed
         random.seed(self.seed)
         random.shuffle(self.data)
+        # FAST
+        self.instr_id_to_idx = {}
+        for i,item in enumerate(self.data):
+            self.instr_id_to_idx[item['instr_id']] = i
+        #
         self.ix = 0
         self.batch_size = batch_size
+        logger.info("R2R batch_size %d"%self.batch_size)
         self._load_nav_graphs()
         self.set_beam_size(beam_size)
         self.print_progress = False
-        print('R2RBatch loaded with %d instructions, using splits: %s' % (len(self.data), ",".join(splits)))
+        logger.info('R2RBatch loaded with %d instructions, using splits: %s' % (len(self.data), ",".join(splits)))
+
+        # test
+        logger.debug(str({k:d for k,d in stat_length.items() if d!=0}))
+        logger.debug("len(self.image_features_list) %d"%len(self.image_features_list))
+        #starting_world_states = self.reset(load_next_minibatch=False)
+        #path_obs, path_actions = self.shortest_paths_to_goals(starting_world_states, max_steps)
+        #feature = self.image_features_list[0].get_features(starting_world_states[0])
+        self.init_action_embedding = _initial_action_embedding(image_features_list[0].feature_dim)
+
+        # R4R
+        self.r4r_follow_detailed_path = args.r4r_follow_detailed_path
+        self.r4r_reward1 = args.r4r_reward1
+        self.r4r_reward2 = args.r4r_reward2
 
     def set_beam_size(self, beam_size, force_reload=False):
         # warning: this will invalidate the environment, self.reset() should be called afterward!
@@ -711,7 +785,7 @@ class R2RBatch():
 
     def _load_nav_graphs(self):
         ''' Load connectivity graph for each scan, useful for reasoning about shortest paths '''
-        print('Loading navigation graphs for %d scans' % len(self.scans))
+        logger.info('Loading navigation graphs for %d scans' % len(self.scans))
         self.graphs = load_nav_graphs(self.scans)
         self.paths = {}
         for scan,G in self.graphs.items(): # compute all shortest paths
@@ -726,6 +800,10 @@ class R2RBatch():
             sys.stderr.write("\rix {} / {}".format(self.ix, len(self.data)))
         if len(batch) < self.batch_size:
             random.shuffle(self.data)
+            # FAST
+            for i,item in enumerate(self.data):
+                self.instr_id_to_idx[item['instr_id']] = i
+            #
             self.ix = self.batch_size - len(batch)
             batch += self.data[:self.ix]
         else:
@@ -746,8 +824,7 @@ class R2RBatch():
         '''
         if state.location.viewpointId == goalViewpointId:
             return 0  # do nothing
-        path = self.paths[state.scanId][state.location.viewpointId][
-            goalViewpointId]
+        path = self.paths[state.scanId][state.location.viewpointId][goalViewpointId]
         nextViewpointId = path[1]
         for n_a, loc_attr in enumerate(adj_loc_list):
             if loc_attr['nextViewpointId'] == nextViewpointId:
@@ -760,18 +837,28 @@ class R2RBatch():
         print('longId:', long_id)
         raise Exception('Bug: nextViewpointId not in adj_loc_list')
 
-    def observe(self, world_states, beamed=False, include_teacher=True):
+    def observe(self, world_states, beamed=False, include_teacher=True, status=None, instr_id=None, history_path=None, is_train=None):
+        # history_path is required only when self.follow_detailed_path and include_teacher
         #start_time = time.time()
+        if status is None:
+            status = self.env.getStates(world_states, beamed=beamed)
         obs = []
-        for i,states_beam in enumerate(self.env.getStates(world_states, beamed=beamed)):
-            item = self.batch[i]
+        for i_batch,states_beam in enumerate(status):
+            item = self.batch[i_batch]
             obs_batch = []
             for state, adj_loc_list in states_beam if beamed else [states_beam]:
-                assert item['scan'] == state.scanId
+                # FAST
+                if item['scan'] != state.scanId:
+                    item = self.data[self.instr_id_to_idx[instr_id]]
+                    assert item['scan'] == state.scanId
+                # /FAST
+                assert item['scan'] == state.scanId, (item['scan'], state.scanId)
                 feature = [featurizer.get_features(state) for featurizer in self.image_features_list]
                 assert len(feature) == 1, 'for now, only work with MeanPooled feature'
+                #print(feature[0].shape)
+                #print(_static_loc_embeddings[state.viewIndex].shape)
                 feature_with_loc = np.concatenate((feature[0], _static_loc_embeddings[state.viewIndex]), axis=-1)
-                action_embedding = _build_action_embedding(adj_loc_list, feature[0])
+                action_embedding = _build_action_embedding(adj_loc_list, feature[0], self.init_action_embedding)
                 ob = {
                     'instr_id' : item['instr_id'],
                     'scan' : state.scanId,
@@ -787,12 +874,156 @@ class R2RBatch():
                     'instructions' : item['instructions'],
                 }
                 if include_teacher:
-                    ob['teacher'] = self._shortest_path_action(state, adj_loc_list, item['path'][-1])
+                    path = item['path']
+                    if self.r4r_follow_detailed_path:
+                        assert not beamed
+                        if not is_train:
+                            ob['teacher'] = 0
+                        else:
+                            #if i_batch==0:
+                            #    import ipdb; ipdb.set_trace()
+                            if history_path is None: # the first time
+                                t = 0
+                            else:
+                                t = len(history_path[i_batch])
+                            #ob['teacher'] = self._shortest_path_action(state, adj_loc_list, item['path'][-1])
+                            #assert t<=len(item["path"]), (i_batch,t+1,len(item["path"]))
+                            #if t>0:
+                            #    assert history_path[i_batch][t-1]==item["path"][t-1]
+                            if t+1>=len(item["path"]):
+                                ob['teacher'] = 0 # last time
+                            else:
+                                next_place = item['path'][t+1]
+                                try: # assert the next place is neibouring
+                                    assert next_place in [loc_attr['nextViewpointId'] for loc_attr in adj_loc_list]
+                                except:
+                                    import ipdb; ipdb.set_trace()
+                                #if state.location.viewpointId == goalViewpointId:
+                                #    return 0  # do nothing
+                                #path = self.paths[state.scanId][state.location.viewpointId][goalViewpointId]
+                                #nextViewpointId = path[1]
+                                #for n_a, loc_attr in enumerate(adj_loc_list):
+                                #    if loc_attr['nextViewpointId'] == nextViewpointId:
+
+                                ob['teacher'] = self._shortest_path_action(state, adj_loc_list, next_place)
+
+                    elif self.r4r_reward1:
+                        if history_path: # the first time
+                            t = len(history_path[i_batch])
+
+                            current_place = ob["viewpoint"]
+                            history_current_path = [current_place] if history_path is None else history_path[i_batch]+[current_place]
+                            def when_last_you_were_on_the_way(reference,real):
+                                for j,place in enumerate(real[::-1]):
+                                    if place in reference:
+                                        how_many_visited = real.count(place)
+                                        how_many_should_visit = reference.count(place)
+                                        you_are_at_n_th_visit_on_reference =  how_many_visited if how_many_visited<how_many_should_visit else how_many_should_visit
+                                        visited = [i for i,v in enumerate(reference) if v==place]
+                                        timestep_on_reference = visited[you_are_at_n_th_visit_on_reference-1]
+                                        #return i,place,reference.index(place)
+                                        leap_from_reference = j
+                                        return leap_from_reference,place,timestep_on_reference
+                                import ipdb; ipdb.set_trace()
+                                return len(real),None,-1
+                            leap_from_reference,_,timestep_on_reference = when_last_you_were_on_the_way(path,history_current_path)
+                            if timestep_on_reference<0:
+                                import ipdb; ipdb.set_trace()
+                            if leap_from_reference==0:
+                                if len(item['path'])==timestep_on_reference+1:
+                                    next_goal = item['path'][-1]
+                                else:
+                                    try:
+                                        next_goal = item['path'][timestep_on_reference+1]
+                                    except:
+                                        import ipdb; ipdb.set_trace()
+                            else:
+                                allowed_skip = leap_from_reference+1
+                                candidate_to_move = []
+                                allowed_to_move = timestep_on_reference+allowed_skip+1 if timestep_on_reference+allowed_skip+1 < len(path) else len(path)
+                                for i in range(timestep_on_reference,allowed_to_move):
+                                    candidate_to_move.append(path[i])
+                                try:
+                                    next_goal = min(candidate_to_move,key=lambda x: self.distances[item['scan']][current_place][x])
+                                except:
+                                    import ipdb; ipdb.set_trace()
+                            ob['teacher'] = self._shortest_path_action(state, adj_loc_list, next_goal)
+                            #if i_batch==0:
+                            #    import ipdb; ipdb.set_trace()
+                        else:
+                            ob['teacher'] = self._shortest_path_action(state, adj_loc_list, path[1])
+
+                    elif self.r4r_reward1 or self.r4r_reward2:
+                        if history_path: # the first time
+                            t = len(history_path[i_batch])
+
+                            current_place = ob["viewpoint"]
+                            history_current_path = [current_place] if history_path is None else history_path[i_batch]+[current_place]
+                            def when_last_you_were_on_the_way(reference,real):
+                                for j,place in enumerate(real[::-1]):
+                                    if place in reference:
+                                        how_many_visited = real.count(place)
+                                        how_many_should_visit = reference.count(place)
+                                        you_are_at_n_th_visit_on_reference =  how_many_visited if how_many_visited<how_many_should_visit else how_many_should_visit
+                                        visited = [i for i,v in enumerate(reference) if v==place]
+                                        timestep_on_reference = visited[you_are_at_n_th_visit_on_reference-1]
+                                        #return i,place,reference.index(place)
+                                        leap_from_reference = j
+                                        return leap_from_reference,place,timestep_on_reference
+                                import ipdb; ipdb.set_trace()
+                                return len(real),None,-1
+                            leap_from_reference,_,timestep_on_reference = when_last_you_were_on_the_way(path,history_current_path)
+                            if timestep_on_reference<0:
+                                import ipdb; ipdb.set_trace()
+                            if leap_from_reference==0:
+                                if len(item['path'])==timestep_on_reference+1:
+                                    next_goal = item['path'][-1]
+                                else:
+                                    try:
+                                        next_goal = item['path'][timestep_on_reference+1]
+                                    except:
+                                        import ipdb; ipdb.set_trace()
+                            else:
+                                allowed_skip = leap_from_reference+1
+                                candidate_to_move = []
+                                allowed_to_move = timestep_on_reference+allowed_skip+1 if timestep_on_reference+allowed_skip+1 < len(path) else len(path)
+                                if self.r4r_reward1:
+                                    for i in range(timestep_on_reference,allowed_to_move):
+                                        candidate_to_move.append(path[i])
+                                    try:
+                                        next_goal = min(candidate_to_move,key=lambda x: self.distances[item['scan']][current_place][x])
+                                    except:
+                                        import ipdb; ipdb.set_trace()
+                                elif self.r4r_reward2:
+                                    cumurative_distance = 0
+                                    cumurative_distances = [self.distances[item['scan']][current_place][path[allowed_to_move-1]]]
+                                    candidate_to_move.append(path[allowed_to_move-1])
+                                    for i in range(allowed_to_move-2,timestep_on_reference,-1):
+                                        cumurative_distance += self.distances[item['scan']][path[i]][path[i+1]]
+                                        cumurative_distances.append(cumurative_distance + self.distances[item['scan']][current_place][path[i]])
+                                        candidate_to_move.append(path[i])
+                                    try:
+                                        goal_th = timestep_on_reference + np.argmin(cumurative_distances[::-1])
+                                        next_goal = path[goal_th]
+                                    except:
+                                        import ipdb; ipdb.set_trace()
+                            ob['teacher'] = self._shortest_path_action(state, adj_loc_list, next_goal)
+                            #if i_batch==0:
+                            #    import ipdb; ipdb.set_trace()
+                        else:
+                            ob['teacher'] = self._shortest_path_action(state, adj_loc_list, path[1])
+
+                    else:
+                        ob['teacher'] = self._shortest_path_action(state, adj_loc_list, path[-1])
+
                 if 'instr_encoding' in item:
                     ob['instr_encoding'] = item['instr_encoding']
+                if 'instr_encoding_bert' in item:
+                    ob['instr_encoding_bert'] = item['instr_encoding_bert']
                 if 'instr_length' in item:
                     ob['instr_length'] = item['instr_length']
                 obs_batch.append(ob)
+                #import ipdb; ipdb.set_trace()
             if beamed:
                 obs.append(obs_batch)
             else:
@@ -813,16 +1044,19 @@ class R2RBatch():
         ''' Load a new minibatch / episodes. '''
         if load_next_minibatch:
             self._next_minibatch(sort)
-        assert len(self.batch) == self.batch_size
+        assert len(self.batch) == self.batch_size, (len(self.batch), self.batch_size)
         return self.get_starting_world_states(self.batch, beamed=beamed)
 
     def step(self, world_states, actions, last_obs, beamed=False):
         ''' Take action (same interface as makeActions) '''
         return self.env.makeActions(world_states, actions, last_obs, beamed=beamed)
 
-    def shortest_paths_to_goals(self, starting_world_states, max_steps):
+    #def shortest_paths_to_goals(self, starting_world_states, max_steps):
+    def referenced_paths_to_goals(self, starting_world_states, max_steps):
         world_states = starting_world_states
-        obs = self.observe(world_states)
+        obs = self.observe(world_states, is_train=True)
+        batch_size = len(obs)
+        history_path = [[ob['viewpoint']] for ob in obs] # required when follow_detailed_path
 
         all_obs = []
         all_actions = []
@@ -834,7 +1068,11 @@ class R2RBatch():
         for t in range(max_steps):
             actions = [ob['teacher'] for ob in obs]
             world_states = self.step(world_states, actions, obs)
-            obs = self.observe(world_states)
+            assert len(world_states)==len(history_path), (len(world_states)==len(history_path))
+            obs = self.observe(world_states, is_train=True, history_path=history_path)
+            for i in range(batch_size):
+                if not ended[i]:
+                    history_path[i].append(obs[i]['viewpoint'])
             for i,ob in enumerate(obs):
                 if not ended[i]:
                     all_obs[i].append(ob)
@@ -845,10 +1083,18 @@ class R2RBatch():
                         ended[i] = True
             if ended.all():
                 break
+        # print("len of all_actions",[len(_) for _ in all_actions])
         return all_obs, all_actions
 
-    def gold_obs_actions_and_instructions(self, max_steps, load_next_minibatch=True):
+    def gold_obs_actions_and_instructions(self, max_steps, load_next_minibatch=True,
+                                          bert=False, r4r_follow_detailed_path=False):
         starting_world_states = self.reset(load_next_minibatch=load_next_minibatch)
-        path_obs, path_actions = self.shortest_paths_to_goals(starting_world_states, max_steps)
-        encoded_instructions = [obs[0]['instr_encoding'] for obs in path_obs]
+        path_obs, path_actions = self.referenced_paths_to_goals(starting_world_states, max_steps)
+        for i, (obs, actions) in enumerate(zip(path_obs, path_actions)): # kurita
+            # don't include the last state, which should result after the stop action
+            assert len(obs) == len(actions) + 1 , "%d %d %d"%(i, len(obs) , len(actions) + 1)
+        if bert:
+            encoded_instructions = [obs[0]['instr_encoding_bert'] for obs in path_obs]
+        else:
+            encoded_instructions = [obs[0]['instr_encoding'] for obs in path_obs]
         return path_obs, path_actions, encoded_instructions

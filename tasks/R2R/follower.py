@@ -98,7 +98,7 @@ def batch_instructions_from_encoded(encoded_instructions, max_length, reverse=Fa
     mask = (seq_tensor == vocab_pad_idx)[:, :max(seq_lengths)]
 
     ret_tp = try_cuda(Variable(seq_tensor, requires_grad=False).long()), \
-             try_cuda(mask.byte()), \
+             try_cuda(mask.bool()), \
              seq_lengths
     if sort:
         ret_tp = ret_tp + (list(perm_idx),)
@@ -339,6 +339,7 @@ class Seq2SeqAgent(BaseAgent):
             beams, _, _ = self.beam_search(self.beam_size)
             return [beam[0] for beam in beams]
 
+    # Score of \Pi_t p_F(a_(t+1)|X,a_t,s_t)
     def _score_obs_actions_and_instructions(self, path_obs, path_actions, encoded_instructions):
         batch_size = len(path_obs)
         assert len(path_actions) == batch_size
@@ -417,7 +418,7 @@ class Seq2SeqAgent(BaseAgent):
 
             # Update ended list
             for i in range(batch_size):
-                action_idx = a_t[i].data[0]
+                action_idx = a_t[i].item()#.data[0]
                 if action_idx == 0:
                     ended[i] = True
 
@@ -507,7 +508,7 @@ class Seq2SeqAgent(BaseAgent):
             # dfried: I changed this so that the ended list is updated afterward; this causes <end> to be added as the last action, along with its score, and the final world state will be duplicated (to more closely match beam search)
             # Make environment action
             for i in range(batch_size):
-                action_idx = a_t[i].data[0]
+                action_idx = a_t[i].item()#.data[0]
                 env_action[i] = action_idx
 
             world_states = self.env.step(world_states, env_action, obs)
@@ -525,7 +526,7 @@ class Seq2SeqAgent(BaseAgent):
 
             # Update ended list
             for i in range(batch_size):
-                action_idx = a_t[i].data[0]
+                action_idx = a_t[i].item()#.data[0]
                 if action_idx == 0:
                     ended[i] = True
 
@@ -535,7 +536,7 @@ class Seq2SeqAgent(BaseAgent):
 
         #self.losses.append(self.loss.data[0] / self.episode_len)
         # shouldn't divide by the episode length because of masking
-        self.losses.append(self.loss.data[0])
+        self.losses.append(self.loss.item())#.data[0])
         return traj
 
     def beam_search(self, beam_size, load_next_minibatch=True, mask_undo=False):
