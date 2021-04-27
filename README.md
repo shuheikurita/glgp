@@ -1,4 +1,4 @@
-# Speaker-Follower Models for Vision-and-Language Navigation
+# Generative Language-Grounded Policy (GLGP) for Vision-and-Language Navigation
 
 This repository contains the code for the following paper:
 
@@ -22,8 +22,20 @@ Shuhei Kurita and Kyunghyun Cho, *Generative Language-Grounded Policy in Vision-
 ### Download and preprocess the data
 
 We follow the setup of R2R dataset in the [speaker-follower model](https://github.com/ronghanghu/speaker_follower).
+See also their repository for the preparation details. We just write down the keypoints here.
 
-1. Download the Precomputing ResNet Image Features, and extract them into `img_features/`:
+1. Repository checkout & Matterport build
+```
+sudo apt-get install libopencv-dev python-opencv freeglut3 freeglut3-dev libglm-dev libjsoncpp-dev doxygen libosmesa6-dev libosmesa6 libglew-dev
+git clone --recursive https://github.com/shuheikurita/glgp.git
+cd glgp
+mkdir build && cd build
+cmake ..
+make
+cd ..
+```
+
+2. Download the Precomputing ResNet Image Features, and extract them into `img_features/`:
 ```
 mkdir -p img_features/
 cd img_features/
@@ -31,11 +43,9 @@ wget https://www.dropbox.com/s/o57kxh2mn5rkx4o/ResNet-152-imagenet.zip?dl=1 -O R
 unzip ResNet-152-imagenet.zip
 cd ..
 ```
-(In case the URL above doesn't work, it is likely because the Room-to-Room dataset changed its feature URLs. You can find the latest download links [here](https://github.com/peteanderson80/Matterport3DSimulator#precomputing-resnet-image-features).)
+(Please see the latest download links [here](https://github.com/peteanderson80/Matterport3DSimulator#precomputing-resnet-image-features) when the URL above doesn't work.)
 
-After this step, `img_features/` should contain `ResNet-152-imagenet.tsv`. (Note that you only need to download the features extracted from ImageNet-pretrained ResNet to run the following experiments. Places-pretrained ResNet features or actual images are not required.)
-
-2. Download the R2R dataset and our sampled trajectories for data augmentation:
+3. Download the R2R dataset and the speaker-follower model's sampled trajectories for data augmentation:
 ```
 ./tasks/R2R/data/download.sh
 ```
