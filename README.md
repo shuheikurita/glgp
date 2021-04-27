@@ -22,11 +22,10 @@ Shuhei Kurita and Kyunghyun Cho, *Generative Language-Grounded Policy in Vision-
 ### Download and preprocess the data
 
 We follow the setup of R2R dataset in the [speaker-follower model](https://github.com/ronghanghu/speaker_follower).
-See also their repository for the preparation details. We just write down the keypoints here.
+See also their repository for the preparation details. We write down the keypoints here.
 
 1. Repository checkout & Matterport build
 ```
-sudo apt-get install libopencv-dev python-opencv freeglut3 freeglut3-dev libglm-dev libjsoncpp-dev doxygen libosmesa6-dev libosmesa6 libglew-dev
 git clone --recursive https://github.com/shuheikurita/glgp.git
 cd glgp
 mkdir build && cd build
